@@ -1,0 +1,183 @@
+[gd_scene load_steps=4 format=3 uid="uid://iydojhm72aq3"]
+
+[ext_resource type="Script" uid="uid://lfmhjv83ncha" path="res://scripts/main_ui.gd" id="1_mhkts"]
+[ext_resource type="Script" uid="uid://ci1kgv8kr7nyn" path="res://scripts/book.gd" id="2_0wfyh"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_1"]
+bg_color = Color(0.12549, 0.12549, 0.12549, 0.901961)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
+
+[node name="Control" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_mhkts")
+
+[node name="Book" type="Node" parent="."]
+script = ExtResource("2_0wfyh")
+
+[node name="MarginContainer" type="MarginContainer" parent="."]
+clip_contents = true
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 20
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 20
+
+[node name="VBoxContainer" type="VBoxContainer" parent="MarginContainer"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="TopBar" type="VBoxContainer" parent="MarginContainer/VBoxContainer"]
+clip_contents = true
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="HBoxContainer" type="HBoxContainer" parent="MarginContainer/VBoxContainer/TopBar"]
+layout_mode = 2
+
+[node name="TOCButton" type="Button" parent="MarginContainer/VBoxContainer/TopBar/HBoxContainer"]
+layout_mode = 2
+text = "Table of Contents"
+
+[node name="ChapterVerseLabel" type="Label" parent="MarginContainer/VBoxContainer/TopBar/HBoxContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 24
+text = "Chapter 1, Verse 1"
+
+[node name="SearchContainer" type="VBoxContainer" parent="MarginContainer/VBoxContainer/TopBar"]
+layout_mode = 2
+
+[node name="SearchBar" type="HBoxContainer" parent="MarginContainer/VBoxContainer/TopBar/SearchContainer"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="SearchInput" type="LineEdit" parent="MarginContainer/VBoxContainer/TopBar/SearchContainer/SearchBar"]
+layout_mode = 2
+size_flags_horizontal = 3
+placeholder_text = "Search in text..."
+
+[node name="SearchClearButton" type="Button" parent="MarginContainer/VBoxContainer/TopBar/SearchContainer/SearchBar"]
+layout_mode = 2
+text = "Clear"
+
+[node name="SearchResultsContainer" type="ScrollContainer" parent="MarginContainer/VBoxContainer/TopBar/SearchContainer"]
+visible = false
+custom_minimum_size = Vector2(0, 150)
+layout_mode = 2
+
+[node name="SearchResultsList" type="VBoxContainer" parent="MarginContainer/VBoxContainer/TopBar/SearchContainer/SearchResultsContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="ScrollContainer" type="ScrollContainer" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+horizontal_scroll_mode = 0
+
+[node name="VerseContainer" type="VBoxContainer" parent="MarginContainer/VBoxContainer/ScrollContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme_override_constants/separation = 20
+
+[node name="OriginalVerse" type="TextEdit" parent="MarginContainer/VBoxContainer/ScrollContainer/VerseContainer"]
+custom_minimum_size = Vector2(0, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 16
+text = "Loading..."
+editable = false
+wrap_mode = 1
+scroll_fit_content_height = true
+
+[node name="EditedVerse" type="TextEdit" parent="MarginContainer/VBoxContainer/ScrollContainer/VerseContainer"]
+custom_minimum_size = Vector2(0, 150)
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_font_sizes/font_size = 16
+text = "Loading..."
+wrap_mode = 1
+scroll_fit_content_height = true
+
+[node name="ButtonContainer" type="HBoxContainer" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="EditActions" type="HBoxContainer" parent="MarginContainer/VBoxContainer/ButtonContainer"]
+layout_mode = 2
+theme_override_constants/separation = 20
+alignment = 1
+
+[node name="SaveButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer/EditActions"]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Save Changes"
+
+[node name="ChangesClearButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer/EditActions"]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Clear Changes"
+
+[node name="Navigation" type="HBoxContainer" parent="MarginContainer/VBoxContainer/ButtonContainer"]
+layout_mode = 2
+size_flags_horizontal = 10
+theme_override_constants/separation = 20
+alignment = 1
+
+[node name="PreviousButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer/Navigation"]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Previous"
+
+[node name="NextButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer/Navigation"]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Next"
+
+[node name="TOCDropdown" type="Panel" parent="."]
+visible = false
+layout_mode = 0
+offset_left = 20.0
+offset_top = 60.0
+offset_right = 570.0
+offset_bottom = 560.0
+theme_override_styles/panel = SubResource("StyleBoxFlat_1")
+
+[node name="MarginContainer" type="MarginContainer" parent="TOCDropdown"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 10
+theme_override_constants/margin_right = 10
+theme_override_constants/margin_bottom = 10
+
+[node name="VBoxContainer" type="VBoxContainer" parent="TOCDropdown/MarginContainer"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="ScrollContainer" type="ScrollContainer" parent="TOCDropdown/MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="TOCContainer" type="VBoxContainer" parent="TOCDropdown/MarginContainer/VBoxContainer/ScrollContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+theme_override_constants/separation = 15
