@@ -291,7 +291,7 @@ func setup_toc():
 		# Add visual indicator for edited chapters
 		var chapter_text = "Chapter %d: %s" % [entry["chapter"], entry["title"]]
 		if has_edits:
-			chapter_text += " *"
+			chapter_text += "*"
 		chapter_header.text = chapter_text
 		
 		chapter_header.add_theme_font_size_override("font_size", 16)
@@ -520,11 +520,7 @@ func highlight_search_terms(text: String, search_terms: String) -> String:
 	return highlighted
 
 func update_toc_selection(chapter: int, verse: int):
-	# Reset previous selections
-	if current_chapter_button:
-		current_chapter_button.modulate = Color(1, 1, 1)
-		if current_chapter_button.has_theme_color_override("font_color"):
-			current_chapter_button.remove_theme_color_override("font_color")
+	# Reset previous verse selection only
 	if current_verse_button:
 		current_verse_button.modulate = Color(1, 1, 1)
 		if current_verse_button.has_theme_color_override("font_color"):
@@ -535,7 +531,19 @@ func update_toc_selection(chapter: int, verse: int):
 		var chapter_section = toc_container.get_child(chapter)
 		if chapter_section:
 			current_chapter_button = chapter_section.get_child(0)  # Chapter header button
-			current_chapter_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
+			
+			# Check if this chapter has edits (preserve the edit indicator color)
+			var has_edits = false
+			for v in range(book.chapters[chapter].size()):
+				var check_key = "Chapter %d, Verse %d" % [chapter + 1, v + 1]
+				if edited_verses.has(check_key):
+					has_edits = true
+					break
+			
+			if has_edits:
+				current_chapter_button.add_theme_color_override("font_color", Color(1.0, 0.8, 0.6))
+			else:
+				current_chapter_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
 			
 			var verse_grid = verse_grids[chapter]
 			if verse >= 0 and verse_grid and verse < verse_grid.get_child_count():
