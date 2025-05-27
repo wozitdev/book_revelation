@@ -338,15 +338,6 @@ func get_original_verse_text(chapter_verse: String) -> String:
 		return chapters[chapter][verse]["text"]
 	return ""
 
-func save_changes() -> bool:
-	var save_file = FileAccess.open("res://Revelation_edited_copy.txt", FileAccess.WRITE)
-	if save_file:
-		var text = get_current_text()
-		save_file.store_string(text)
-		save_file.close()
-		return true
-	return false
-
 func search_including_edits(query: String, edited_verses: Dictionary) -> Array:
 	if query.length() < 2:
 		return []

@@ -22,27 +22,32 @@ var current_verse_button = null
 var edited_verses = {}
 var search_timer: Timer
 var last_search_text = ""
+
 var session_data = {
-	"last_position": {"chapter": 0, "verse": 0}
+	"last_position": {"chapter": 0, "verse": 0},
+	"expanded_chapters": {}  # Will be populated with proper keys
 }
 
 func _ready():
 	await get_tree().process_frame
 	
 	if text_display and edited_text_display and chapter_verse_label and book:
-		setup_export_button()
 		setup_search_timer()
-		
-		# Load saved data
 		load_session_data()
 		load_edited_verses()
 		
-		# Setup TOC first
+		# Setup TOC after loading session data
 		if toc_container:
 			setup_toc()
 		
 		# Navigate to saved position or default to Chapter 1, Verse 1
-		book.navigate_to(session_data.last_position.chapter, session_data.last_position.verse)
+		# Ensure the saved position is valid
+		if not book.navigate_to(session_data.last_position.chapter, session_data.last_position.verse):
+			# If navigation fails, reset to first verse
+			session_data.last_position.chapter = 0
+			session_data.last_position.verse = 0
+			book.navigate_to(0, 0)
+			save_session_data()
 		
 		# Update display and TOC selection
 		update_display()
@@ -64,11 +69,9 @@ func _ready():
 		# Setup text editors
 		text_display.editable = false
 		text_display.add_theme_color_override("font_color", Color(1, 1, 1))
-		text_display.context_menu_enabled = false
 		
 		edited_text_display.editable = true
 		edited_text_display.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
-		edited_text_display.context_menu_enabled = false
 
 func setup_search_timer():
 	search_timer = Timer.new()
@@ -77,129 +80,41 @@ func setup_search_timer():
 	search_timer.timeout.connect(_perform_search)
 	add_child(search_timer)
 
-func setup_export_button():
-	var edit_actions = $MarginContainer/VBoxContainer/ButtonContainer/EditActions
-	var export_button = Button.new()
-	export_button.text = "Export to File"
-	export_button.custom_minimum_size = Vector2(120, 40)
-	export_button.pressed.connect(_on_export_button_pressed)
-	edit_actions.add_child(export_button)
-
-func _on_export_button_pressed():
-	var file_dialog = FileDialog.new()
-	file_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
-	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
-	file_dialog.current_dir = OS.get_system_dir(OS.SYSTEM_DIR_DOCUMENTS)
-	file_dialog.current_file = "Revelation_edited.txt"
-	file_dialog.add_filter("*.txt", "Text Files")
-	
-	add_child(file_dialog)
-	file_dialog.file_selected.connect(_on_export_file_selected)
-	file_dialog.popup_centered(Vector2i(800, 600))
-
-func _on_export_file_selected(path: String):
-	var original_file = FileAccess.open("res://Revelation.txt", FileAccess.READ)
-	if not original_file:
-		print("Error: Could not open original Revelation.txt file")
-		return
-	
-	var content = original_file.get_as_text()
-	original_file.close()
-	
-	# Process each edited verse in proper order
-	var edited_keys = edited_verses.keys()
-	
-	# Sort by chapter and verse to ensure proper processing
-	edited_keys.sort_custom(func(a, b):
-		var parts_a = a.replace("Chapter ", "").replace("Verse ", "").split(", ")
-		var parts_b = b.replace("Chapter ", "").replace("Verse ", "").split(", ")
-		var ch_a = parts_a[0].to_int()
-		var v_a = parts_a[1].to_int()
-		var ch_b = parts_b[0].to_int()
-		var v_b = parts_b[1].to_int()
-		if ch_a != ch_b:
-			return ch_a < ch_b
-		return v_a < v_b
-	)
-	
-	# Apply edits in reverse order to maintain correct positions
-	edited_keys.reverse()
-	
-	for chapter_verse_key in edited_keys:
-		var edited_text = edited_verses[chapter_verse_key]
-		
-		# Extract chapter and verse numbers from key
-		var parts = chapter_verse_key.replace("Chapter ", "").replace("Verse ", "").split(", ")
-		if parts.size() == 2:
-			var chapter_num = parts[0].to_int()
-			var verse_num = parts[1].to_int()
-			
-			# Format chapter and verse numbers with proper zero padding
-			var verse_pattern = "66:%03d:%03d " % [chapter_num, verse_num]
-			
-			# Find start and end of this verse
-			var start_pos = content.find(verse_pattern)
-			if start_pos != -1:
-				# Find the end of this verse
-				var line_start = content.rfind("\n", start_pos)
-				if line_start == -1:
-					line_start = 0
-				else:
-					line_start += 1
-				
-				# Find next verse or chapter
-				var next_verse_pattern = "66:%03d:%03d " % [chapter_num, verse_num + 1]
-				var next_chapter_pattern = "66:%03d:001 " % [chapter_num + 1]
-				
-				var end_pos = content.length()
-				var next_verse_pos = content.find(next_verse_pattern, start_pos)
-				var next_chapter_pos = content.find(next_chapter_pattern, start_pos)
-				
-				if next_verse_pos != -1:
-					end_pos = content.rfind("\n", next_verse_pos)
-					if end_pos == -1:
-						end_pos = next_verse_pos
-				elif next_chapter_pos != -1:
-					end_pos = content.rfind("\n", next_chapter_pos)
-					if end_pos == -1:
-						end_pos = next_chapter_pos
-				
-				# Replace the verse text while keeping the reference
-				var replacement = verse_pattern + edited_text
-				if end_pos < content.length():
-					replacement += "\n"
-				
-				content = content.substr(0, line_start) + replacement + content.substr(end_pos + 1)
-	
-	# Write to export file
-	var export_file = FileAccess.open(path, FileAccess.WRITE)
-	if export_file:
-		export_file.store_string(content)
-		export_file.close()
-		print("Export completed: " + path)
-	else:
-		print("Error: Could not create export file")
-
 func load_session_data():
+	# Initialize with default values first
+	session_data = {
+		"last_position": {"chapter": 0, "verse": 0},
+		"expanded_chapters": {}
+	}
+	
 	var file = FileAccess.open("user://session_data.json", FileAccess.READ)
 	if file:
 		var data = JSON.parse_string(file.get_as_text())
 		file.close()
 		if data:
-			session_data = data
-		else:
-			session_data = {
-				"last_position": {"chapter": 0, "verse": 0},
-			}
-	else:
-		session_data = {
-			"last_position": {"chapter": 0, "verse": 0},
-		}
+				# Load last position
+			if data.has("last_position"):
+				session_data.last_position = data.last_position
+			
+			# Load expanded chapters
+			if data.has("expanded_chapters"):
+				for key in data.expanded_chapters:
+					var chapter_index = int(key) if key is String else key
+					session_data.expanded_chapters[chapter_index] = data.expanded_chapters[key]
 
 func save_session_data():
+	# Convert integer keys to strings for JSON compatibility
+	var save_data = {
+		"last_position": session_data.last_position,
+		"expanded_chapters": {}
+	}
+	
+	for chapter_index in session_data.expanded_chapters:
+		save_data.expanded_chapters[str(chapter_index)] = session_data.expanded_chapters[chapter_index]
+	
 	var file = FileAccess.open("user://session_data.json", FileAccess.WRITE)
 	if file:
-		file.store_string(JSON.stringify(session_data))
+		file.store_string(JSON.stringify(save_data))
 		file.close()
 
 func _on_search_input_text_changed(text: String):
@@ -208,6 +123,7 @@ func _on_search_input_text_changed(text: String):
 	
 	if text.length() < 2:
 		search_results_container.hide()
+		clear_search_highlighting()
 		return
 	
 	search_timer.start()
@@ -216,10 +132,12 @@ func _on_clear_search_pressed():
 	search_input.text = ""
 	last_search_text = ""
 	search_results_container.hide()
+	clear_search_highlighting()
 
 func _perform_search():
 	if last_search_text.length() < 2:
 		search_results_container.hide()
+		clear_search_highlighting()
 		return
 	
 	var results = book.search_including_edits(last_search_text, edited_verses)
@@ -232,17 +150,20 @@ func _perform_search():
 		)
 		display_search_results(results, last_search_text)
 		search_results_container.show()
+		apply_search_highlighting()
 	else:
 		search_results_container.hide()
+		clear_search_highlighting()
 
 func _on_search_result_clicked(chapter: int, verse: int):
-	book.navigate_to(chapter, verse)
-	session_data.last_position.chapter = chapter
-	session_data.last_position.verse = verse
-	save_session_data()
-	
-	update_display()
-	update_toc_selection(chapter, verse)
+	if book.navigate_to(chapter, verse):
+		session_data.last_position.chapter = chapter
+		session_data.last_position.verse = verse
+		save_session_data()
+		
+		update_display()
+		update_toc_selection(chapter, verse)
+		apply_search_highlighting()
 
 func _on_previous_button_pressed():
 	if book.previous_verse():
@@ -291,8 +212,9 @@ func setup_toc():
 		# Add visual indicator for edited chapters
 		var chapter_text = "Chapter %d: %s" % [entry["chapter"], entry["title"]]
 		if has_edits:
-			chapter_text += "*"
-		chapter_header.text = chapter_text
+			chapter_header.text = "*" + chapter_text
+		else:
+			chapter_header.text = chapter_text
 		
 		chapter_header.add_theme_font_size_override("font_size", 16)
 		chapter_header.flat = true
@@ -305,17 +227,20 @@ func setup_toc():
 		
 		# Highlight if this is the current chapter
 		if entry["chapter"] - 1 == book.current_chapter:
+			chapter_header.text = ">" + chapter_text
 			chapter_header.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
 		
 		var verse_grid = GridContainer.new()
 		verse_grid.columns = 10
-		verse_grid.visible = false
-		verse_grids[entry["chapter"] - 1] = verse_grid
+		var chapter_index = entry["chapter"] - 1
+		# Only expand if it was previously expanded in session data
+		verse_grid.visible = session_data.expanded_chapters.get(chapter_index, false)
+		verse_grids[chapter_index] = verse_grid
 		
 		chapter_section.add_child(chapter_header)
 		chapter_section.add_child(verse_grid)
 		
-		chapter_header.pressed.connect(_on_chapter_header_pressed.bind(entry["chapter"] - 1))
+		chapter_header.pressed.connect(_on_chapter_header_pressed.bind(chapter_index))
 		
 		for verse in range(entry["verse_count"]):
 			var verse_button = Button.new()
@@ -329,19 +254,15 @@ func setup_toc():
 				verse_button.text = str(verse + 1)
 			
 			verse_button.custom_minimum_size = Vector2(30, 30)
-			verse_button.pressed.connect(_on_verse_button_pressed.bind(entry["chapter"] - 1, verse))
+			verse_button.pressed.connect(_on_verse_button_pressed.bind(chapter_index, verse))
 			
 			# Highlight current verse
-			if entry["chapter"] - 1 == book.current_chapter and verse == book.current_verse:
+			if chapter_index == book.current_chapter and verse == book.current_verse:
 				verse_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
 			
 			verse_grid.add_child(verse_button)
 		
 		toc_container.add_child(chapter_section)
-		
-		# Expand current chapter
-		if entry["chapter"] - 1 == book.current_chapter:
-			verse_grid.visible = true
 
 func _on_chapter_header_pressed(chapter: int):
 	# Prevent collapsing the currently selected chapter
@@ -350,6 +271,8 @@ func _on_chapter_header_pressed(chapter: int):
 	
 	var verse_grid = verse_grids[chapter]
 	verse_grid.visible = !verse_grid.visible
+	session_data.expanded_chapters[chapter] = verse_grid.visible
+	save_session_data()
 
 func update_display():
 	var current_text = book.get_current_text()
@@ -362,12 +285,61 @@ func update_display():
 	chapter_verse_label.text = chapter_verse
 	update_toc_selection(book.current_chapter, book.current_verse)
 	
-	# Clear edit indicators when changing verses
 	update_toc_edit_indicators()
+	apply_search_highlighting()
+
+func update_toc_selection(chapter: int, verse: int):
+	# Reset previous verse selection only
+	if current_verse_button:
+		current_verse_button.modulate = Color(1, 1, 1)
+		if current_verse_button.has_theme_color_override("font_color"):
+			current_verse_button.remove_theme_color_override("font_color")
+	
+	# Update current selections
+	if chapter < toc_container.get_child_count():
+		var chapter_section = toc_container.get_child(chapter)
+		if chapter_section:
+			current_chapter_button = chapter_section.get_child(0)  # Chapter header button
+			
+			# Check if this chapter has edits (preserve the edit indicator color)
+			var has_edits = false
+			for v in range(book.chapters[chapter].size()):
+				var check_key = "Chapter %d, Verse %d" % [chapter + 1, v + 1]
+				if edited_verses.has(check_key):
+					has_edits = true
+					break
+			
+			if has_edits:
+				current_chapter_button.add_theme_color_override("font_color", Color(1.0, 0.8, 0.6))
+			else:
+				current_chapter_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
+			
+			var verse_grid = verse_grids[chapter]
+			if verse >= 0 and verse_grid and verse < verse_grid.get_child_count():
+				current_verse_button = verse_grid.get_child(verse)
+				current_verse_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
+				
+				# Ensure current chapter is expanded
+				if not verse_grid.visible:
+					verse_grid.visible = true
+					session_data.expanded_chapters[chapter] = true
+					save_session_data()
 
 func update_toc_edit_indicators():
-	# Refresh the TOC to update edit indicators
+	# Store current expanded states
+	var current_expanded_states = {}
+	for chapter_idx in verse_grids:
+		if verse_grids[chapter_idx]:
+			current_expanded_states[chapter_idx] = verse_grids[chapter_idx].visible
+	
+	# Setup TOC
 	setup_toc()
+	
+	# Restore expanded states
+	for chapter_idx in current_expanded_states:
+		if verse_grids.has(chapter_idx) and verse_grids[chapter_idx]:
+			verse_grids[chapter_idx].visible = current_expanded_states[chapter_idx]
+			session_data.expanded_chapters[chapter_idx] = current_expanded_states[chapter_idx]
 
 func _on_save_button_pressed():
 	var chapter_verse = book.get_chapter_verse()
@@ -380,8 +352,8 @@ func _on_save_button_pressed():
 		return
 	
 	save_edit(chapter_verse, edited_text)
-	# Update TOC to show new edit indicator
 	update_toc_edit_indicators()
+	save_session_data()
 
 func _on_changes_clear_button_pressed():
 	edited_text_display.text = text_display.text
@@ -506,50 +478,191 @@ func display_search_results(results: Array, search_text: String):
 		
 		search_results_list.add_child(result_container)
 
+func escape_regex_string(string: String) -> String:
+	# Escape special regex characters
+	var special_chars = ["\\", ".", "+", "*", "?", "^", "$", "(", ")", "[", "]", "{", "}", "|"]
+	var escaped = string
+	for special_char in special_chars:
+		escaped = escaped.replace(special_char, "\\" + special_char)
+	return escaped
+
 func highlight_search_terms(text: String, search_terms: String) -> String:
 	var words = search_terms.to_lower().split(" ")
 	var highlighted = text
+	var text_words = text.to_lower().split(" ")
 	
-	for word in words:
+	# Find all words to highlight (exact and fuzzy matches)
+	var words_to_highlight = []
+	
+	for search_word in words:
+		if search_word.length() >= 2:
+			# Add exact matches
+			words_to_highlight.append(search_word)
+			
+			# Find fuzzy matches in the text
+			for text_word in text_words:
+				var clean_text_word = clean_word_for_highlighting(text_word)
+				if clean_text_word.length() >= 2:
+					var similarity = calculate_similarity(search_word, clean_text_word)
+					if similarity > 0.7 and clean_text_word != search_word:
+						words_to_highlight.append(clean_text_word)
+	
+	# Remove duplicates
+	var unique_words = {}
+	for word in words_to_highlight:
+		unique_words[word] = true
+	
+	# Apply highlighting with fuzzy matching
+	for word in unique_words:
 		if word.length() >= 2:
-			# Use case-insensitive replacement with BBCode highlighting
 			var regex = RegEx.new()
-			regex.compile("(?i)\\b" + word + "\\b")
+			regex.compile("(?i)\\b" + escape_regex_string(word) + "\\b")
 			highlighted = regex.sub(highlighted, "[bgcolor=#ffff00][color=#000000]$0[/color][/bgcolor]", true)
 	
 	return highlighted
 
-func update_toc_selection(chapter: int, verse: int):
-	# Reset previous verse selection only
-	if current_verse_button:
-		current_verse_button.modulate = Color(1, 1, 1)
-		if current_verse_button.has_theme_color_override("font_color"):
-			current_verse_button.remove_theme_color_override("font_color")
+func highlight_text_in_display(text_edit: TextEdit, search_terms: String):
+	# Clear previous search highlighting by removing syntax highlighter
+	if text_edit.syntax_highlighter != null:
+		text_edit.syntax_highlighter = null
 	
-	# Update current selections
-	if chapter < toc_container.get_child_count():
-		var chapter_section = toc_container.get_child(chapter)
-		if chapter_section:
-			current_chapter_button = chapter_section.get_child(0)  # Chapter header button
-			
-			# Check if this chapter has edits (preserve the edit indicator color)
-			var has_edits = false
-			for v in range(book.chapters[chapter].size()):
-				var check_key = "Chapter %d, Verse %d" % [chapter + 1, v + 1]
-				if edited_verses.has(check_key):
-					has_edits = true
-					break
-			
-			if has_edits:
-				current_chapter_button.add_theme_color_override("font_color", Color(1.0, 0.8, 0.6))
+	if search_terms.length() < 2:
+		return
+	
+	# Create a new syntax highlighter for search terms
+	var highlighter = CodeHighlighter.new()
+	
+	# Split search terms into individual words
+	var words = search_terms.to_lower().split(" ")
+	var text_content = text_edit.text.to_lower()
+	
+	# Find all matching words and phrases in the text
+	var matches_to_highlight = []
+	
+	# First, try to match the complete search phrase
+	if search_terms.length() >= 2:
+		var phrase_matches = find_phrase_matches(text_content, search_terms.to_lower())
+		matches_to_highlight.append_array(phrase_matches)
+	
+	# Then match individual words with fuzzy matching
+	for search_word in words:
+		if search_word.length() >= 2:
+			var word_matches = find_word_matches(text_content, search_word)
+			matches_to_highlight.append_array(word_matches)
+	
+	# Remove duplicates and apply highlighting
+	var unique_matches = {}
+	for match in matches_to_highlight:
+		unique_matches[match] = true
+	
+	# Add color highlighting for each unique match
+	for match in unique_matches:
+		if match.length() >= 2:
+			highlighter.add_keyword_color(match, Color.YELLOW)
+			# Also add variations with different cases
+			highlighter.add_keyword_color(match.capitalize(), Color.YELLOW)
+			highlighter.add_keyword_color(match.to_upper(), Color.YELLOW)
+	
+	text_edit.syntax_highlighter = highlighter
+
+func find_phrase_matches(text: String, phrase: String) -> Array:
+	var matches = []
+	var start = 0
+	
+	while start < text.length():
+		var index = text.find(phrase, start)
+		if index == -1:
+			break
+		
+		# Extract the actual text from the original (preserving case)
+		var actual_phrase = text.substr(index, phrase.length())
+		matches.append(actual_phrase)
+		start = index + phrase.length()
+	
+	return matches
+
+func find_word_matches(text: String, search_word: String) -> Array:
+	var matches = []
+	var words = text.split(" ")
+	
+	for word in words:
+		var clean_word = clean_word_for_highlighting(word)
+		if clean_word.length() >= 2:
+			# Check for exact match
+			if clean_word == search_word:
+				matches.append(clean_word)
 			else:
-				current_chapter_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
-			
-			var verse_grid = verse_grids[chapter]
-			if verse >= 0 and verse_grid and verse < verse_grid.get_child_count():
-				current_verse_button = verse_grid.get_child(verse)
-				current_verse_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
-				
-				# Ensure current chapter is expanded
-				if not verse_grid.visible:
-					verse_grid.visible = true
+				# Check for fuzzy match
+				var similarity = calculate_similarity(search_word, clean_word)
+				if similarity > 0.7:
+					matches.append(clean_word)
+	
+	return matches
+
+func clean_word_for_highlighting(word: String) -> String:
+	# Remove common punctuation and convert to lowercase
+	var cleaned = word.to_lower()
+	cleaned = cleaned.replace(",", "")
+	cleaned = cleaned.replace(".", "")
+	cleaned = cleaned.replace(";", "")
+	cleaned = cleaned.replace(":", "")
+	cleaned = cleaned.replace("!", "")
+	cleaned = cleaned.replace("?", "")
+	cleaned = cleaned.replace("\"", "")
+	cleaned = cleaned.replace("(", "")
+	cleaned = cleaned.replace(")", "")
+	cleaned = cleaned.replace("[", "")
+	cleaned = cleaned.replace("]", "")
+	return cleaned.strip_edges()
+
+func calculate_similarity(word1: String, word2: String) -> float:
+	if word1 == word2:
+		return 1.0
+	
+	var len1 = word1.length()
+	var len2 = word2.length()
+	
+	# Quick length check - if too different, low similarity
+	if abs(len1 - len2) > max(len1, len2) * 0.5:
+		return 0.0
+	
+	# Levenshtein distance calculation
+	var matrix = []
+	for i in range(len1 + 1):
+		matrix.append([])
+		for j in range(len2 + 1):
+			matrix[i].append(0)
+	
+	for i in range(len1 + 1):
+		matrix[i][0] = i
+	for j in range(len2 + 1):
+		matrix[0][j] = j
+	
+	for i in range(1, len1 + 1):
+		for j in range(1, len2 + 1):
+			var cost = 0 if word1[i-1] == word2[j-1] else 1
+			matrix[i][j] = min(
+				matrix[i-1][j] + 1,      # deletion
+				matrix[i][j-1] + 1,      # insertion
+				matrix[i-1][j-1] + cost  # substitution
+			)
+	
+	var distance = matrix[len1][len2]
+	var max_len = max(len1, len2)
+	return 1.0 - (float(distance) / float(max_len))
+
+func apply_search_highlighting():
+	# Apply search highlighting to both original and edited text displays
+	if last_search_text.length() >= 2:
+		highlight_text_in_display(text_display, last_search_text)
+		highlight_text_in_display(edited_text_display, last_search_text)
+
+func clear_search_highlighting():
+	# Clear search highlighting from both text displays
+	if text_display.syntax_highlighter != null:
+		text_display.syntax_highlighter = null
+	if edited_text_display.syntax_highlighter != null:
+		edited_text_display.syntax_highlighter = null
+
+func _exit_tree():
+	save_session_data()
