@@ -439,6 +439,20 @@ func load_edited_verses():
 			edited_verses = {}
 	else:
 		edited_verses = {}
+	
+	# If no edited verses exist, create default edit for Chapter 1, Verse 1
+	if edited_verses.is_empty():
+		var default_verse_key = "Chapter 1, Verse 1"
+		var default_verse_text = "The Revelation of Gaben, which God gave unto him, to shew unto his servants things which must soon™ come to pass; and he sent and signified it by his angel unto his servant John: 🎱"
+		
+		edited_verses[default_verse_key] = default_verse_text
+		
+		# Save the default edit to file
+		var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
+		if write_file:
+			write_file.store_string(JSON.stringify(edited_verses))
+			write_file.close()
+			print("Created default edit for " + default_verse_key)
 
 func display_search_results(results: Array, search_text: String):
 	# Clear previous results
