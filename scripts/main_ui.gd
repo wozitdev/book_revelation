@@ -13,19 +13,31 @@ extends Control
 @onready var save_button = $MarginContainer/VBoxContainer/ButtonContainer/EditActions/SaveButton
 @onready var changes_clear_button = $MarginContainer/VBoxContainer/ButtonContainer/EditActions/ChangesClearButton
 @onready var toc_button = $MarginContainer/VBoxContainer/TopBar/HBoxContainer/TOCButton
+@onready var pages_button = $MarginContainer/VBoxContainer/TopBar/HBoxContainer/PagesButton
+@onready var pages_panel = $PagesPanel
+@onready var pages_content = $PagesPanel/MarginContainer/VBoxContainer/ScrollContainer/PagesContent
+@onready var pages_close_button = $PagesPanel/MarginContainer/VBoxContainer/Header/CloseButton
+@onready var sticky_chapter_label = $PagesPanel/MarginContainer/VBoxContainer/Header/StickyChapterLabel
 @onready var previous_button = $MarginContainer/VBoxContainer/ButtonContainer/Navigation/PreviousButton
 @onready var next_button = $MarginContainer/VBoxContainer/ButtonContainer/Navigation/NextButton
 
 var verse_grids = {}  # Store verse grids by chapter for collapsing
+var chapter_containers = []  # Store chapter containers for scroll tracking
 var current_chapter_button = null
 var current_verse_button = null
 var edited_verses = {}
 var search_timer: Timer
 var last_search_text = ""
+var pages_scroll_container: ScrollContainer
+
+# Lazy loading variables
+var pages_data_cached = false
+var pages_chapter_data = []  # Pre-computed chapter data for faster rendering
 
 var session_data = {
-	"last_position": {"chapter": 0, "verse": 0},
-	"expanded_chapters": {}  # Will be populated with proper keys
+	"last_position": {"chapter": 1, "verse": 0},  # chapter is 1-based, verse is 0-based
+	"expanded_chapters": {},  # Will be populated with proper keys
+	"pages_scroll_position": 0  # Scroll position in pages view
 }
 
 func _ready():
@@ -41,12 +53,13 @@ func _ready():
 			setup_toc()
 		
 		# Navigate to saved position or default to Chapter 1, Verse 1
-		# Ensure the saved position is valid
-		if not book.navigate_to(session_data.last_position.chapter, session_data.last_position.verse):
-			# If navigation fails, reset to first verse
-			session_data.last_position.chapter = 0
+		# session_data: chapter is 1-based, verse is 0-based
+		# navigate_to expects: chapter (1-based), verse (1-based)
+		if not book.navigate_to(session_data.last_position.chapter, session_data.last_position.verse + 1):
+			# If navigation fails, reset to first verse (Chapter 1, Verse 1)
+			session_data.last_position.chapter = 1
 			session_data.last_position.verse = 0
-			book.navigate_to(0, 0)
+			book.navigate_to(1, 1)
 			save_session_data()
 		
 		# Update display and TOC selection
@@ -61,6 +74,8 @@ func _ready():
 		save_button.pressed.connect(_on_save_button_pressed)
 		changes_clear_button.pressed.connect(_on_changes_clear_button_pressed)
 		toc_button.pressed.connect(_on_toc_button_pressed)
+		pages_button.pressed.connect(_on_pages_button_pressed)
+		pages_close_button.pressed.connect(_on_pages_close_pressed)
 		previous_button.pressed.connect(_on_previous_button_pressed)
 		next_button.pressed.connect(_on_next_button_pressed)
 		search_input.text_changed.connect(_on_search_input_text_changed)
@@ -72,6 +87,63 @@ func _ready():
 		
 		edited_text_display.editable = true
 		edited_text_display.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+		
+		# Get scroll container reference and populate pages on launch
+		pages_scroll_container = $PagesPanel/MarginContainer/VBoxContainer/ScrollContainer
+		await populate_pages_view()
+		
+		# Initialize sticky label to chapter 1
+		sticky_chapter_label.text = "Chapter 1: %s" % book.chapter_titles[0] if book.chapter_titles.size() > 0 else "Chapter 1"
+		
+		# Connect scroll signal for sticky chapter header
+		pages_scroll_container.get_v_scroll_bar().value_changed.connect(_on_pages_scroll)
+		
+		# Restore scroll position after a frame
+		await get_tree().process_frame
+		if pages_scroll_container:
+			pages_scroll_container.scroll_vertical = session_data.pages_scroll_position
+			# Only update if we've scrolled (not at position 0)
+			if session_data.pages_scroll_position > 0:
+				_update_sticky_chapter_label()
+
+func _on_pages_scroll(_value: float):
+	_update_sticky_chapter_label()
+
+func _update_sticky_chapter_label():
+	if not pages_scroll_container or chapter_containers.size() == 0:
+		return
+	
+	var scroll_pos = pages_scroll_container.scroll_vertical
+	var current_chapter_idx = 0
+	
+	# Find which chapter is at the top of the scroll view
+	for i in range(chapter_containers.size()):
+		var container = chapter_containers[i]
+		# Check if container is still valid (not freed)
+		if not is_instance_valid(container):
+			return
+		if container.position.y <= scroll_pos + 50:  # 50px tolerance
+			current_chapter_idx = i
+	
+	# Update sticky label and pages title
+	var chapter_num = current_chapter_idx + 1
+	var chapter_title = book.chapter_titles[current_chapter_idx] if current_chapter_idx < book.chapter_titles.size() else ""
+	sticky_chapter_label.text = "Chapter %d: %s" % [chapter_num, chapter_title]
+
+func _unhandled_input(event):
+	if event is InputEventKey and event.pressed:
+		if event.ctrl_pressed and event.keycode == KEY_S:
+			_on_save_button_pressed()
+			get_viewport().set_input_as_handled()
+		elif event.keycode == KEY_ESCAPE:
+			# Close pages panel or TOC on Escape
+			if pages_panel.visible:
+				_save_pages_scroll_position()
+				pages_panel.visible = false
+				get_viewport().set_input_as_handled()
+			elif toc_panel.visible:
+				toc_panel.visible = false
+				get_viewport().set_input_as_handled()
 
 func setup_search_timer():
 	search_timer = Timer.new()
@@ -81,41 +153,79 @@ func setup_search_timer():
 	add_child(search_timer)
 
 func load_session_data():
-	# Initialize with default values first
+	# Initialize with default values first (chapter is 1-based, verse is 0-based)
 	session_data = {
-		"last_position": {"chapter": 0, "verse": 0},
-		"expanded_chapters": {}
+		"last_position": {"chapter": 1, "verse": 0},
+		"expanded_chapters": {},
+		"pages_scroll_position": 0
 	}
 	
-	var file = FileAccess.open("user://session_data.json", FileAccess.READ)
-	if file:
-		var data = JSON.parse_string(file.get_as_text())
-		file.close()
-		if data:
-				# Load last position
-			if data.has("last_position"):
-				session_data.last_position = data.last_position
-			
-			# Load expanded chapters
-			if data.has("expanded_chapters"):
-				for key in data.expanded_chapters:
-					var chapter_index = int(key) if key is String else key
-					session_data.expanded_chapters[chapter_index] = data.expanded_chapters[key]
+	var data = null
+	
+	# Web-compatible loading
+	if OS.has_feature("web"):
+		# Use JavaScript localStorage for web builds
+		var json_string = _web_storage_get("revelation_session_data")
+		if json_string != "":
+			data = JSON.parse_string(json_string)
+	else:
+		# Use normal file system for desktop
+		var file = FileAccess.open("user://session_data.json", FileAccess.READ)
+		if file:
+			data = JSON.parse_string(file.get_as_text())
+			file.close()
+	
+	if data:
+		# Load last position
+		if data.has("last_position"):
+			session_data.last_position = data.last_position
+		
+		# Load expanded chapters
+		if data.has("expanded_chapters"):
+			for key in data.expanded_chapters:
+				var chapter_index = int(key) if key is String else key
+				session_data.expanded_chapters[chapter_index] = data.expanded_chapters[key]
+		
+		# Load pages scroll position
+		if data.has("pages_scroll_position"):
+			session_data.pages_scroll_position = int(data.pages_scroll_position)
 
 func save_session_data():
 	# Convert integer keys to strings for JSON compatibility
 	var save_data = {
 		"last_position": session_data.last_position,
-		"expanded_chapters": {}
+		"expanded_chapters": {},
+		"pages_scroll_position": session_data.pages_scroll_position
 	}
 	
 	for chapter_index in session_data.expanded_chapters:
 		save_data.expanded_chapters[str(chapter_index)] = session_data.expanded_chapters[chapter_index]
 	
-	var file = FileAccess.open("user://session_data.json", FileAccess.WRITE)
-	if file:
-		file.store_string(JSON.stringify(save_data))
-		file.close()
+	# Web-compatible saving
+	if OS.has_feature("web"):
+		# Use JavaScript localStorage for web builds with proper escaping
+		var json_string = JSON.stringify(save_data)
+		_web_storage_set("revelation_session_data", json_string)
+	else:
+		# Use normal file system for desktop
+		var file = FileAccess.open("user://session_data.json", FileAccess.WRITE)
+		if file:
+			file.store_string(JSON.stringify(save_data))
+			file.close()
+
+# Helper functions for web storage with proper escaping
+func _web_storage_set(key: String, value: String):
+	# Use encodeURIComponent for safe storage of special characters
+	var encoded_value = value.uri_encode()
+	var js_code = "(function(){try{localStorage.setItem('%s',decodeURIComponent('%s'));return true;}catch(e){console.error('Storage error:',e);return false;}})();" % [key, encoded_value]
+	JavaScriptBridge.eval(js_code)
+
+func _web_storage_get(key: String) -> String:
+	var js_code = "(function(){var val=localStorage.getItem('%s');return val!==null?encodeURIComponent(val):null;})();" % [key]
+	var result = JavaScriptBridge.eval(js_code)
+	if result != null and str(result) != "null" and str(result) != "":
+		return str(result).uri_decode()
+	return ""
 
 func _on_search_input_text_changed(text: String):
 	search_timer.stop()
@@ -156,13 +266,15 @@ func _perform_search():
 		clear_search_highlighting()
 
 func _on_search_result_clicked(chapter: int, verse: int):
+	# chapter and verse from search results are 1-based
 	if book.navigate_to(chapter, verse):
-		session_data.last_position.chapter = chapter
-		session_data.last_position.verse = verse
+		# Save using book's current state for consistency (chapter is 1-based, verse is 0-based)
+		session_data.last_position.chapter = book.current_chapter
+		session_data.last_position.verse = book.current_verse
 		save_session_data()
 		
 		update_display()
-		update_toc_selection(chapter, verse)
+		update_toc_selection(book.current_chapter, book.current_verse)
 		apply_search_highlighting()
 
 func _on_previous_button_pressed():
@@ -184,13 +296,218 @@ func _on_next_button_pressed():
 		update_toc_selection(book.current_chapter, book.current_verse)
 
 func _on_verse_button_pressed(chapter: int, verse: int):
-	if book.navigate_to(chapter, verse):
-		session_data.last_position.chapter = chapter
-		session_data.last_position.verse = verse
+	# chapter and verse are 0-based from the TOC, convert to 1-based for navigate_to
+	if book.navigate_to(chapter + 1, verse + 1):
+		# Save using book's current state for consistency (chapter is 1-based, verse is 0-based)
+		session_data.last_position.chapter = book.current_chapter
+		session_data.last_position.verse = book.current_verse
 		save_session_data()
 		
 		update_display()
-		update_toc_selection(chapter, verse)
+		update_toc_selection(book.current_chapter, book.current_verse)
+
+func _on_toc_button_pressed():
+	toc_panel.visible = !toc_panel.visible
+	# Hide pages panel if opening TOC
+	if toc_panel.visible:
+		_save_pages_scroll_position()
+		pages_panel.visible = false
+
+func _on_pages_button_pressed():
+	# Hide TOC when opening pages
+	toc_panel.visible = false
+	pages_panel.visible = true
+	# Refresh pages view to show any newly edited verses
+	await populate_pages_view()
+	# Restore scroll position after showing
+	await get_tree().process_frame
+	if pages_scroll_container:
+		pages_scroll_container.scroll_vertical = session_data.pages_scroll_position
+
+func _on_pages_close_pressed():
+	_save_pages_scroll_position()
+	pages_panel.visible = false
+
+func _save_pages_scroll_position():
+	if pages_scroll_container:
+		session_data.pages_scroll_position = pages_scroll_container.scroll_vertical
+		save_session_data()
+
+func populate_pages_view():
+	# Use cached data if available and not stale
+	if not pages_data_cached:
+		_prepare_pages_data()
+	
+	# Clear existing content
+	for child in pages_content.get_children():
+		child.queue_free()
+	
+	# Wait for nodes to be freed
+	await get_tree().process_frame
+	
+	# Clear chapter containers tracking
+	chapter_containers.clear()
+	
+	# Render all chapters with pre-computed data
+	for chapter_data in pages_chapter_data:
+		var chapter_container = VBoxContainer.new()
+		chapter_container.add_theme_constant_override("separation", 15)
+		# Force consistent width across all chapters
+		chapter_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		chapter_container.custom_minimum_size.x = 800  # Adjust this value if needed
+		
+		# Chapter header
+		var chapter_header = Label.new()
+		chapter_header.text = chapter_data["header_text"]
+		chapter_header.add_theme_font_size_override("font_size", 28)
+		chapter_header.add_theme_color_override("font_color", Color(0.6, 0.8, 1.0))
+		chapter_header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		chapter_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		chapter_container.add_child(chapter_header)
+		
+		# Separator line
+		var separator = HSeparator.new()
+		chapter_container.add_child(separator)
+		
+		# Verses container
+		var verses_container = VBoxContainer.new()
+		verses_container.add_theme_constant_override("separation", 12)
+		verses_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		for verse_data in chapter_data["verses"]:
+			if verse_data["has_edit"]:
+				# Use RichTextLabel for edited verses to show inline highlights
+				var verse_label = RichTextLabel.new()
+				verse_label.bbcode_enabled = true
+				verse_label.fit_content = true
+				verse_label.scroll_active = false
+				verse_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+				verse_label.add_theme_font_size_override("normal_font_size", 24)
+				# Add background color to highlight edited verse
+				verse_label.add_theme_color_override("default_color", Color(0.95, 0.95, 0.85))
+				verse_label.text = verse_data["bbcode"]
+				verses_container.add_child(verse_label)
+			else:
+				# Use Label for unedited verses (faster)
+				var verse_label = Label.new()
+				verse_label.text = verse_data["text"]
+				verse_label.add_theme_font_size_override("font_size", 24)
+				verse_label.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0))
+				verse_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+				verse_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+				verses_container.add_child(verse_label)
+		
+		chapter_container.add_child(verses_container)
+		
+		# Add spacing after chapter
+		var spacer = Control.new()
+		spacer.custom_minimum_size.y = 40
+		chapter_container.add_child(spacer)
+		
+		# Track chapter container for scroll position tracking
+		chapter_containers.append(chapter_container)
+		pages_content.add_child(chapter_container)
+
+func _prepare_pages_data():
+	# Pre-compute all chapter and verse data for faster rendering
+	pages_chapter_data.clear()
+	
+	var chapter_keys = book.chapters.keys()
+	chapter_keys.sort()
+	
+	for chapter_num in chapter_keys:
+		var chapter_verses = book.chapters[chapter_num]
+		var chapter_title = book.chapter_titles[chapter_num - 1] if chapter_num - 1 < book.chapter_titles.size() else ""
+		
+		var chapter_data = {
+			"header_text": "Chapter %d: %s" % [chapter_num, chapter_title],
+			"verses": []
+		}
+		
+		for verse_idx in range(chapter_verses.size()):
+			var verse_data = chapter_verses[verse_idx]
+			var verse_num = verse_data["verse"] if verse_data.has("verse") else verse_idx + 1
+			var original_text = verse_data["text"] if verse_data.has("text") else ""
+			
+			# Check if this verse has been edited
+			var verse_key = "Chapter %d, Verse %d" % [chapter_num, verse_num]
+			var has_edit = edited_verses.has(verse_key)
+			
+			if has_edit:
+				var edited_text = edited_verses[verse_key]
+				var highlighted_text = _highlight_changes(original_text, edited_text)
+				chapter_data["verses"].append({
+					"has_edit": true,
+					"bbcode": "[color=#ffda66]✱[/color] [color=#888888]%d.[/color] %s" % [verse_num, highlighted_text],
+					"text": ""
+				})
+			else:
+				chapter_data["verses"].append({
+					"has_edit": false,
+					"bbcode": "",
+					"text": "%d. %s" % [verse_num, original_text]
+				})
+		
+		pages_chapter_data.append(chapter_data)
+	
+	pages_data_cached = true
+
+func _highlight_changes(original: String, edited: String) -> String:
+	# Word-by-word diff to highlight only changed portions
+	var orig_words = original.split(" ")
+	var edit_words = edited.split(" ")
+	
+	var result = ""
+	var i = 0
+	var j = 0
+	
+	while i < orig_words.size() or j < edit_words.size():
+		if i >= orig_words.size():
+			# Extra words added at end
+			while j < edit_words.size():
+				result += "[color=#ffda66]" + edit_words[j] + "[/color] "
+				j += 1
+		elif j >= edit_words.size():
+			# Words removed from end - skip them (they're gone)
+			break
+		elif orig_words[i] == edit_words[j]:
+			# Words match - show in white
+			result += "[color=#ffffff]" + edit_words[j] + "[/color] "
+			i += 1
+			j += 1
+		else:
+			# Words differ - find how many consecutive different words
+			var edit_start = j
+			var found_match = false
+			
+			# Look ahead in edited to find next matching word from original
+			for look_ahead in range(1, mini(10, edit_words.size() - j)):
+				if i < orig_words.size() and j + look_ahead < edit_words.size():
+					if orig_words[i] == edit_words[j + look_ahead]:
+						# Found where they sync up again - highlight the changed portion
+						while j < edit_start + look_ahead:
+							result += "[color=#ffda66]" + edit_words[j] + "[/color] "
+							j += 1
+						found_match = true
+						break
+			
+			if not found_match:
+				# Check if original word was replaced
+				var orig_found_later = false
+				for look_ahead in range(1, mini(10, orig_words.size() - i)):
+					if i + look_ahead < orig_words.size() and j < edit_words.size():
+						if orig_words[i + look_ahead] == edit_words[j]:
+							# Original words were deleted, skip them
+							i += look_ahead
+							orig_found_later = true
+							break
+				
+				if not orig_found_later:
+					# Simple replacement - highlight the edited word
+					result += "[color=#ffda66]" + edit_words[j] + "[/color] "
+					i += 1
+					j += 1
+	
+	return result.strip_edges()
 
 func setup_toc():
 	for child in toc_container.get_children():
@@ -216,7 +533,7 @@ func setup_toc():
 		else:
 			chapter_header.text = chapter_text
 		
-		chapter_header.add_theme_font_size_override("font_size", 16)
+		chapter_header.add_theme_font_size_override("font_size", 20)
 		chapter_header.flat = true
 		chapter_header.alignment = HORIZONTAL_ALIGNMENT_LEFT
 		chapter_header.custom_minimum_size.x = 500
@@ -225,8 +542,8 @@ func setup_toc():
 		if has_edits:
 			chapter_header.add_theme_color_override("font_color", Color(1.0, 0.8, 0.6))
 		
-		# Highlight if this is the current chapter
-		if entry["chapter"] - 1 == book.current_chapter:
+		# Highlight if this is the current chapter (entry["chapter"] is 1-based, book.current_chapter is 1-based)
+		if entry["chapter"] == book.current_chapter:
 			chapter_header.text = ">" + chapter_text
 			chapter_header.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
 		
@@ -253,11 +570,13 @@ func setup_toc():
 			else:
 				verse_button.text = str(verse + 1)
 			
-			verse_button.custom_minimum_size = Vector2(30, 30)
+			# Make verse buttons twice as big (60x60 instead of 30x30)
+			verse_button.custom_minimum_size = Vector2(35, 35)
+			verse_button.add_theme_font_size_override("font_size", 18)
 			verse_button.pressed.connect(_on_verse_button_pressed.bind(chapter_index, verse))
 			
-			# Highlight current verse
-			if chapter_index == book.current_chapter and verse == book.current_verse:
+			# Highlight current verse (entry["chapter"] is 1-based = book.current_chapter, verse is 0-based = book.current_verse)
+			if entry["chapter"] == book.current_chapter and verse == book.current_verse:
 				verse_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
 			
 			verse_grid.add_child(verse_button)
@@ -265,8 +584,9 @@ func setup_toc():
 		toc_container.add_child(chapter_section)
 
 func _on_chapter_header_pressed(chapter: int):
+	# chapter is 0-based index, book.current_chapter is 1-based
 	# Prevent collapsing the currently selected chapter
-	if chapter == book.current_chapter:
+	if chapter + 1 == book.current_chapter:
 		return
 	
 	var verse_grid = verse_grids[chapter]
@@ -282,13 +602,19 @@ func update_display():
 	var saved_edit = load_edit(chapter_verse)
 	edited_text_display.text = saved_edit if saved_edit else current_text
 	
-	chapter_verse_label.text = chapter_verse
+	# Get chapter title and display with full format
+	var chapter_title = book.chapter_titles[book.current_chapter - 1] if book.current_chapter - 1 < book.chapter_titles.size() else ""
+	chapter_verse_label.text = "%s: %s" % [chapter_verse, chapter_title]
+	
 	update_toc_selection(book.current_chapter, book.current_verse)
 	
 	update_toc_edit_indicators()
 	apply_search_highlighting()
 
 func update_toc_selection(chapter: int, verse: int):
+	# chapter is 1-based (from book.current_chapter), verse is 0-based (from book.current_verse)
+	var chapter_idx = chapter - 1  # Convert to 0-based for TOC indexing
+	
 	# Reset previous verse selection only
 	if current_verse_button:
 		current_verse_button.modulate = Color(1, 1, 1)
@@ -296,15 +622,15 @@ func update_toc_selection(chapter: int, verse: int):
 			current_verse_button.remove_theme_color_override("font_color")
 	
 	# Update current selections
-	if chapter < toc_container.get_child_count():
-		var chapter_section = toc_container.get_child(chapter)
+	if chapter_idx >= 0 and chapter_idx < toc_container.get_child_count():
+		var chapter_section = toc_container.get_child(chapter_idx)
 		if chapter_section:
 			current_chapter_button = chapter_section.get_child(0)  # Chapter header button
 			
 			# Check if this chapter has edits (preserve the edit indicator color)
 			var has_edits = false
 			for v in range(book.chapters[chapter].size()):
-				var check_key = "Chapter %d, Verse %d" % [chapter + 1, v + 1]
+				var check_key = "Chapter %d, Verse %d" % [chapter, v + 1]
 				if edited_verses.has(check_key):
 					has_edits = true
 					break
@@ -314,7 +640,7 @@ func update_toc_selection(chapter: int, verse: int):
 			else:
 				current_chapter_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
 			
-			var verse_grid = verse_grids[chapter]
+			var verse_grid = verse_grids[chapter_idx]
 			if verse >= 0 and verse_grid and verse < verse_grid.get_child_count():
 				current_verse_button = verse_grid.get_child(verse)
 				current_verse_button.add_theme_color_override("font_color", Color(0.3, 0.7, 1.0))
@@ -322,7 +648,7 @@ func update_toc_selection(chapter: int, verse: int):
 				# Ensure current chapter is expanded
 				if not verse_grid.visible:
 					verse_grid.visible = true
-					session_data.expanded_chapters[chapter] = true
+					session_data.expanded_chapters[chapter_idx] = true
 					save_session_data()
 
 func update_toc_edit_indicators():
@@ -365,13 +691,20 @@ func _on_changes_clear_button_pressed():
 func save_edit(chapter_verse: String, text: String):
 	var save_data = {}
 	
-	# Load existing saves first
-	var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
-	if read_file:
-		var data = JSON.parse_string(read_file.get_as_text())
-		if data:
-			save_data = data
-		read_file.close()
+	# Load existing saves first - web compatible
+	if OS.has_feature("web"):
+		var json_string = _web_storage_get("revelation_edited_verses")
+		if json_string != "":
+			var data = JSON.parse_string(json_string)
+			if data:
+				save_data = data
+	else:
+		var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
+		if read_file:
+			var data = JSON.parse_string(read_file.get_as_text())
+			if data:
+				save_data = data
+			read_file.close()
 	
 	# Update with new edit
 	save_data[chapter_verse] = text
@@ -379,34 +712,57 @@ func save_edit(chapter_verse: String, text: String):
 	# Update local copy
 	edited_verses[chapter_verse] = text
 	
-	# Save back to file
-	var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
-	if write_file:
-		write_file.store_string(JSON.stringify(save_data))
-		write_file.close()
+	# Invalidate pages cache
+	pages_data_cached = false
+	
+	# Save back - web compatible
+	if OS.has_feature("web"):
+		var json_string = JSON.stringify(save_data)
+		_web_storage_set("revelation_edited_verses", json_string)
 		print("Saved edit for " + chapter_verse)
 	else:
-		print("Error: Could not save edit")
+		var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
+		if write_file:
+			write_file.store_string(JSON.stringify(save_data))
+			write_file.close()
+			print("Saved edit for " + chapter_verse)
+		else:
+			print("Error: Could not save edit")
 
 func load_edit(chapter_verse: String) -> String:
-	var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
-	if read_file:
-		var data = JSON.parse_string(read_file.get_as_text())
-		read_file.close()
-		if data and data.has(chapter_verse):
-			return data[chapter_verse]
+	# Web compatible loading
+	if OS.has_feature("web"):
+		var json_string = _web_storage_get("revelation_edited_verses")
+		if json_string != "":
+			var data = JSON.parse_string(json_string)
+			if data and data.has(chapter_verse):
+				return data[chapter_verse]
+	else:
+		var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
+		if read_file:
+			var data = JSON.parse_string(read_file.get_as_text())
+			read_file.close()
+			if data and data.has(chapter_verse):
+				return data[chapter_verse]
 	return ""
 
 func clear_edit(chapter_verse: String):
 	var save_data = {}
 	
-	# Load existing saves first
-	var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
-	if read_file:
-		var data = JSON.parse_string(read_file.get_as_text())
-		if data:
-			save_data = data
-		read_file.close()
+	# Load existing saves first - web compatible
+	if OS.has_feature("web"):
+		var json_string = _web_storage_get("revelation_edited_verses")
+		if json_string != "":
+			var data = JSON.parse_string(json_string)
+			if data:
+				save_data = data
+	else:
+		var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
+		if read_file:
+			var data = JSON.parse_string(read_file.get_as_text())
+			if data:
+				save_data = data
+			read_file.close()
 	
 	# Remove the edit if it exists
 	if save_data.has(chapter_verse):
@@ -416,29 +772,46 @@ func clear_edit(chapter_verse: String):
 		if edited_verses.has(chapter_verse):
 			edited_verses.erase(chapter_verse)
 		
-		# Save back to file
-		var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
-		if write_file:
-			write_file.store_string(JSON.stringify(save_data))
-			write_file.close()
+		# Invalidate pages cache
+		pages_data_cached = false
+		
+		# Save back - web compatible
+		if OS.has_feature("web"):
+			var json_string = JSON.stringify(save_data)
+			_web_storage_set("revelation_edited_verses", json_string)
 			print("Cleared edit for " + chapter_verse)
 		else:
-			print("Error: Could not save after clearing edit")
-
-func _on_toc_button_pressed():
-	toc_panel.visible = !toc_panel.visible
+			var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
+			if write_file:
+				write_file.store_string(JSON.stringify(save_data))
+				write_file.close()
+				print("Cleared edit for " + chapter_verse)
+			else:
+				print("Error: Could not save after clearing edit")
 
 func load_edited_verses():
-	var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
-	if read_file:
-		var data = JSON.parse_string(read_file.get_as_text())
-		read_file.close()
-		if data:
-			edited_verses = data
+	# Web compatible loading
+	if OS.has_feature("web"):
+		var json_string = _web_storage_get("revelation_edited_verses")
+		if json_string != "":
+			var data = JSON.parse_string(json_string)
+			if data:
+				edited_verses = data
+			else:
+				edited_verses = {}
 		else:
 			edited_verses = {}
 	else:
-		edited_verses = {}
+		var read_file = FileAccess.open("user://edited_verses.json", FileAccess.READ)
+		if read_file:
+			var data = JSON.parse_string(read_file.get_as_text())
+			read_file.close()
+			if data:
+				edited_verses = data
+			else:
+				edited_verses = {}
+		else:
+			edited_verses = {}
 	
 	# If no edited verses exist, create default edit for Chapter 1, Verse 1
 	if edited_verses.is_empty():
@@ -447,12 +820,17 @@ func load_edited_verses():
 		
 		edited_verses[default_verse_key] = default_verse_text
 		
-		# Save the default edit to file
-		var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
-		if write_file:
-			write_file.store_string(JSON.stringify(edited_verses))
-			write_file.close()
+		# Save the default edit - web compatible
+		if OS.has_feature("web"):
+			var json_string = JSON.stringify(edited_verses)
+			_web_storage_set("revelation_edited_verses", json_string)
 			print("Created default edit for " + default_verse_key)
+		else:
+			var write_file = FileAccess.open("user://edited_verses.json", FileAccess.WRITE)
+			if write_file:
+				write_file.store_string(JSON.stringify(edited_verses))
+				write_file.close()
+				print("Created default edit for " + default_verse_key)
 
 func display_search_results(results: Array, search_text: String):
 	# Clear previous results
@@ -465,7 +843,7 @@ func display_search_results(results: Array, search_text: String):
 		
 		# Create clickable header
 		var header_button = Button.new()
-		header_button.text = "Chapter %d, Verse %d" % [result["chapter"] + 1, result["verse"] + 1]
+		header_button.text = "Chapter %d, Verse %d" % [result["chapter"], result["verse"]]
 		header_button.flat = true
 		header_button.alignment = HORIZONTAL_ALIGNMENT_LEFT
 		header_button.add_theme_font_size_override("font_size", 14)

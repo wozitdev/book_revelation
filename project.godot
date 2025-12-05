@@ -12,8 +12,12 @@ config_version=5
 
 config/name="book_revelation"
 run/main_scene="res://scenes/main.tscn"
-config/features=PackedStringArray("4.4", "GL Compatibility")
+config/features=PackedStringArray("4.5", "GL Compatibility")
 config/icon="res://icon.svg"
+
+[debug]
+
+settings/stdout/verbose_stdout=true
 
 [dotnet]
 
@@ -23,3 +27,8 @@ project/assembly_name="book_revelation"
 
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
+
+[web]
+
+#Enablewebcompatibilityfeatureslocal_storage/enable=true
+canvas_resize/policy=2
