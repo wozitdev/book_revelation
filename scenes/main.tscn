@@ -62,7 +62,7 @@ text = "Table of Contents"
 [node name="ChapterVerseLabel" type="Label" parent="MarginContainer/VBoxContainer/TopBar/HBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
-theme_override_font_sizes/font_size = 24
+theme_override_font_sizes/font_size = 22
 text = "Chapter 1, Verse 1"
 
 [node name="PagesButton" type="Button" parent="MarginContainer/VBoxContainer/TopBar/HBoxContainer"]
@@ -146,6 +146,16 @@ text = "Save Changes"
 custom_minimum_size = Vector2(120, 40)
 layout_mode = 2
 text = "Clear Changes"
+
+[node name="ExportButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer/EditActions"]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Export"
+
+[node name="ImportButton" type="Button" parent="MarginContainer/VBoxContainer/ButtonContainer/EditActions"]
+custom_minimum_size = Vector2(120, 40)
+layout_mode = 2
+text = "Import"
 
 [node name="Navigation" type="HBoxContainer" parent="MarginContainer/VBoxContainer/ButtonContainer"]
 layout_mode = 2
@@ -231,8 +241,8 @@ layout_mode = 2
 theme_override_constants/separation = 20
 
 [node name="StickyChapterLabel" type="Label" parent="PagesPanel/MarginContainer/VBoxContainer/Header"]
+custom_minimum_size = Vector2(800, 0)
 layout_mode = 2
-size_flags_horizontal = 3
 theme_override_colors/font_color = Color(0.6, 0.8, 1, 1)
 theme_override_font_sizes/font_size = 32
 text = "Chapter 1: The Vision of Christ and Letters to Seven Churches"

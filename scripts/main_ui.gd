@@ -12,6 +12,8 @@ extends Control
 @onready var toc_container = $TOCDropdown/MarginContainer/VBoxContainer/ScrollContainer/TOCContainer
 @onready var save_button = $MarginContainer/VBoxContainer/ButtonContainer/EditActions/SaveButton
 @onready var changes_clear_button = $MarginContainer/VBoxContainer/ButtonContainer/EditActions/ChangesClearButton
+@onready var export_button = $MarginContainer/VBoxContainer/ButtonContainer/EditActions/ExportButton
+@onready var import_button = $MarginContainer/VBoxContainer/ButtonContainer/EditActions/ImportButton
 @onready var toc_button = $MarginContainer/VBoxContainer/TopBar/HBoxContainer/TOCButton
 @onready var pages_button = $MarginContainer/VBoxContainer/TopBar/HBoxContainer/PagesButton
 @onready var pages_panel = $PagesPanel
@@ -29,10 +31,22 @@ var edited_verses = {}
 var search_timer: Timer
 var last_search_text = ""
 var pages_scroll_container: ScrollContainer
+var file_dialog: FileDialog
+var pending_export_text = ""  # Text waiting to be exported
+var pending_export_format = ""  # Track which format to export (json or txt)
+var showing_original = false  # Track if currently showing original text
 
 # Lazy loading variables
 var pages_data_cached = false
 var pages_chapter_data = []  # Pre-computed chapter data for faster rendering
+
+# Live highlighting variables
+var current_original_text = ""  # Original text for comparison
+var previous_edited_text = ""   # Previous state for detecting changes
+var previous_caret_column = 0   # Previous cursor position
+var previous_caret_line = 0
+var is_updating_text = false    # Flag to prevent recursive updates
+var edit_highlighter: CodeHighlighter = null
 
 var session_data = {
 	"last_position": {"chapter": 1, "verse": 0},  # chapter is 1-based, verse is 0-based
@@ -73,6 +87,8 @@ func _ready():
 		# Connect signals
 		save_button.pressed.connect(_on_save_button_pressed)
 		changes_clear_button.pressed.connect(_on_changes_clear_button_pressed)
+		export_button.pressed.connect(_on_export_button_pressed)
+		import_button.pressed.connect(_on_import_button_pressed)
 		toc_button.pressed.connect(_on_toc_button_pressed)
 		pages_button.pressed.connect(_on_pages_button_pressed)
 		pages_close_button.pressed.connect(_on_pages_close_pressed)
@@ -87,6 +103,10 @@ func _ready():
 		
 		edited_text_display.editable = true
 		edited_text_display.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+		
+		# Setup live inline highlighting
+		_setup_inline_highlighter()
+		edited_text_display.text_changed.connect(_on_edited_text_changed)
 		
 		# Get scroll container reference and populate pages on launch
 		pages_scroll_container = $PagesPanel/MarginContainer/VBoxContainer/ScrollContainer
@@ -451,63 +471,684 @@ func _prepare_pages_data():
 	
 	pages_data_cached = true
 
-func _highlight_changes(original: String, edited: String) -> String:
-	# Word-by-word diff to highlight only changed portions
-	var orig_words = original.split(" ")
-	var edit_words = edited.split(" ")
+func _highlight_changes(_original: String, edited: String) -> String:
+	# Process revision tags for Pages view display using BBCode
+	# [rev_del] content is removed entirely (it's deleted text)
+	# [rev_add] content is shown in green
+	# [rev_mod] content is shown in yellow
 	
+	var result = edited
+	
+	# Remove [rev_del] tags and their contents entirely
+	var del_regex = RegEx.new()
+	del_regex.compile("\\[rev_del\\].*?\\[/rev_del\\]")
+	result = del_regex.sub(result, "", true)
+	
+	# Convert [rev_add] to green BBCode
+	result = result.replace("[rev_add]", "[color=#66ff66]")
+	result = result.replace("[/rev_add]", "[/color]")
+	
+	# Convert [rev_mod] to yellow BBCode
+	result = result.replace("[rev_mod]", "[color=#ffda66]")
+	result = result.replace("[/rev_mod]", "[/color]")
+	
+	# Clean up double spaces
+	result = result.replace("  ", " ").strip_edges()
+	
+	return result
+
+# ============================================================================
+# AUTOMATIC DIFF TAGGING SYSTEM
+# ============================================================================
+
+func _strip_all_tags(text: String) -> String:
+	# Remove all revision tags AND display markers from text to get clean content
+	var result = text
+	
+	# Remove storage tags (delete tags remove content, add/mod keep content)
+	var del_regex = RegEx.new()
+	del_regex.compile("\\[rev_del\\].*?\\[/rev_del\\]")
+	result = del_regex.sub(result, "", true)
+	result = result.replace("[rev_add]", "").replace("[/rev_add]", "")
+	result = result.replace("[rev_mod]", "").replace("[/rev_mod]", "")
+	
+	# Remove display markers (deletion markers remove content too)
+	var display_del_regex = RegEx.new()
+	display_del_regex.compile("\\[/[^/]*/\\]")
+	result = display_del_regex.sub(result, "", true)
+	result = result.replace("[+", "").replace("+]", "")
+	result = result.replace("[*", "").replace("*]", "")
+	
+	# Clean up double spaces
+	while result.contains("  "):
+		result = result.replace("  ", " ")
+	return result.strip_edges()
+
+func _tokenize_text(text: String) -> Array:
+	# Split text into tokens (words and punctuation) preserving order
+	var tokens = []
+	var current_word = ""
+	
+	for i in range(text.length()):
+		var c = text[i]
+		if c == " " or c == "\n" or c == "\t":
+			if current_word != "":
+				tokens.append(current_word)
+				current_word = ""
+		elif c in [".", ",", ";", ":", "!", "?", "(", ")", "[", "]", "\"", "'"]:
+			if current_word != "":
+				tokens.append(current_word)
+				current_word = ""
+			tokens.append(c)
+		else:
+			current_word += c
+	
+	if current_word != "":
+		tokens.append(current_word)
+	
+	return tokens
+
+func _compute_lcs_table(tokens_a: Array, tokens_b: Array) -> Array:
+	# Compute Longest Common Subsequence table
+	var m = tokens_a.size()
+	var n = tokens_b.size()
+	var dp = []
+	
+	for i in range(m + 1):
+		var row = []
+		for j in range(n + 1):
+			row.append(0)
+		dp.append(row)
+	
+	for i in range(1, m + 1):
+		for j in range(1, n + 1):
+			if tokens_a[i - 1] == tokens_b[j - 1]:
+				dp[i][j] = dp[i - 1][j - 1] + 1
+			else:
+				dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+	
+	return dp
+
+func _backtrack_diff(tokens_a: Array, tokens_b: Array, dp: Array) -> Array:
+	# Backtrack through LCS table to generate diff operations
+	# Returns array of {"op": "keep"|"del"|"add", "token": String}
+	var diff = []
+	var i = tokens_a.size()
+	var j = tokens_b.size()
+	
+	while i > 0 or j > 0:
+		if i > 0 and j > 0 and tokens_a[i - 1] == tokens_b[j - 1]:
+			diff.push_front({"op": "keep", "token": tokens_a[i - 1]})
+			i -= 1
+			j -= 1
+		elif j > 0 and (i == 0 or dp[i][j - 1] >= dp[i - 1][j]):
+			diff.push_front({"op": "add", "token": tokens_b[j - 1]})
+			j -= 1
+		else:
+			diff.push_front({"op": "del", "token": tokens_a[i - 1]})
+			i -= 1
+	
+	return diff
+
+func _detect_modifications(diff: Array) -> Array:
+	# Post-process diff to detect modifications (del immediately followed by add)
+	var result = []
+	var i = 0
+	
+	while i < diff.size():
+		var current = diff[i]
+		
+		# Look for del followed by add pattern (modification)
+		if current.op == "del":
+			# Collect consecutive deletions
+			var del_tokens = []
+			while i < diff.size() and diff[i].op == "del":
+				del_tokens.append(diff[i].token)
+				i += 1
+			
+			# Check if followed by additions
+			var add_tokens = []
+			while i < diff.size() and diff[i].op == "add":
+				add_tokens.append(diff[i].token)
+				i += 1
+			
+			# Decide if it's a modification or separate del/add
+			if del_tokens.size() > 0 and add_tokens.size() > 0:
+				# Check if they look like a modification (similar length, similar position)
+				var is_modification = _looks_like_modification(del_tokens, add_tokens)
+				if is_modification:
+					# Mark as modification
+					for token in del_tokens:
+						result.append({"op": "del", "token": token})
+					for token in add_tokens:
+						result.append({"op": "mod", "token": token})
+				else:
+					# Keep as separate del and add
+					for token in del_tokens:
+						result.append({"op": "del", "token": token})
+					for token in add_tokens:
+						result.append({"op": "add", "token": token})
+			else:
+				# Just deletions or just additions
+				for token in del_tokens:
+					result.append({"op": "del", "token": token})
+				for token in add_tokens:
+					result.append({"op": "add", "token": token})
+		else:
+			result.append(current)
+			i += 1
+	
+	return result
+
+func _looks_like_modification(del_tokens: Array, add_tokens: Array) -> bool:
+	# Heuristic to determine if del+add is actually a modification
+	# Consider it a modification if:
+	# 1. Similar word count (within 2 words)
+	# 2. Or the tokens have some character similarity
+	
+	var len_diff = abs(del_tokens.size() - add_tokens.size())
+	if len_diff <= 2:
+		return true
+	
+	# Check if any words are similar (partial match)
+	for del_token in del_tokens:
+		for add_token in add_tokens:
+			if _word_similarity(del_token, add_token) > 0.5:
+				return true
+	
+	return false
+
+func _word_similarity(word1: String, word2: String) -> float:
+	# Simple character-based similarity
+	var w1 = word1.to_lower()
+	var w2 = word2.to_lower()
+	
+	if w1 == w2:
+		return 1.0
+	
+	# Check prefix match
+	var min_len = min(w1.length(), w2.length())
+	var common_prefix = 0
+	for i in range(min_len):
+		if w1[i] == w2[i]:
+			common_prefix += 1
+		else:
+			break
+	
+	var max_len = max(w1.length(), w2.length())
+	return float(common_prefix) / float(max_len)
+
+func _build_tagged_text(diff: Array) -> String:
+	# Build the final text with appropriate tags
 	var result = ""
 	var i = 0
-	var j = 0
 	
-	while i < orig_words.size() or j < edit_words.size():
-		if i >= orig_words.size():
-			# Extra words added at end
-			while j < edit_words.size():
-				result += "[color=#ffda66]" + edit_words[j] + "[/color] "
-				j += 1
-		elif j >= edit_words.size():
-			# Words removed from end - skip them (they're gone)
-			break
-		elif orig_words[i] == edit_words[j]:
-			# Words match - show in white
-			result += "[color=#ffffff]" + edit_words[j] + "[/color] "
+	while i < diff.size():
+		var current = diff[i]
+		
+		if current.op == "keep":
+			if result != "" and not result.ends_with(" ") and not current.token in [".", ",", ";", ":", "!", "?", ")", "]", "\""]:
+				result += " "
+			result += current.token
 			i += 1
-			j += 1
-		else:
-			# Words differ - find how many consecutive different words
-			var edit_start = j
-			var found_match = false
-			
-			# Look ahead in edited to find next matching word from original
-			for look_ahead in range(1, mini(10, edit_words.size() - j)):
-				if i < orig_words.size() and j + look_ahead < edit_words.size():
-					if orig_words[i] == edit_words[j + look_ahead]:
-						# Found where they sync up again - highlight the changed portion
-						while j < edit_start + look_ahead:
-							result += "[color=#ffda66]" + edit_words[j] + "[/color] "
-							j += 1
-						found_match = true
-						break
-			
-			if not found_match:
-				# Check if original word was replaced
-				var orig_found_later = false
-				for look_ahead in range(1, mini(10, orig_words.size() - i)):
-					if i + look_ahead < orig_words.size() and j < edit_words.size():
-						if orig_words[i + look_ahead] == edit_words[j]:
-							# Original words were deleted, skip them
-							i += look_ahead
-							orig_found_later = true
-							break
-				
-				if not orig_found_later:
-					# Simple replacement - highlight the edited word
-					result += "[color=#ffda66]" + edit_words[j] + "[/color] "
-					i += 1
-					j += 1
+		elif current.op == "del":
+			# Collect consecutive deletions
+			var del_tokens = []
+			while i < diff.size() and diff[i].op == "del":
+				del_tokens.append(diff[i].token)
+				i += 1
+			if del_tokens.size() > 0:
+				if result != "" and not result.ends_with(" "):
+					result += " "
+				result += "[rev_del]" + " ".join(del_tokens) + "[/rev_del]"
+		elif current.op == "add":
+			# Collect consecutive additions
+			var add_tokens = []
+			while i < diff.size() and diff[i].op == "add":
+				add_tokens.append(diff[i].token)
+				i += 1
+			if add_tokens.size() > 0:
+				if result != "" and not result.ends_with(" ") and not add_tokens[0] in [".", ",", ";", ":", "!", "?", ")", "]", "\""]:
+					result += " "
+				result += "[rev_add]" + " ".join(add_tokens) + "[/rev_add]"
+		elif current.op == "mod":
+			# Collect consecutive modifications
+			var mod_tokens = []
+			while i < diff.size() and diff[i].op == "mod":
+				mod_tokens.append(diff[i].token)
+				i += 1
+			if mod_tokens.size() > 0:
+				if result != "" and not result.ends_with(" ") and not mod_tokens[0] in [".", ",", ";", ":", "!", "?", ")", "]", "\""]:
+					result += " "
+				result += "[rev_mod]" + " ".join(mod_tokens) + "[/rev_mod]"
+	
+	# Clean up spacing around punctuation
+	result = result.replace(" .", ".").replace(" ,", ",").replace(" ;", ";")
+	result = result.replace(" :", ":").replace(" !", "!").replace(" ?", "?")
+	result = result.replace("( ", "(").replace(" )", ")")
+	
+	# Clean up double spaces
+	while result.contains("  "):
+		result = result.replace("  ", " ")
 	
 	return result.strip_edges()
+
+func generate_auto_tags(original: String, edited: String) -> String:
+	# Main function to automatically generate revision tags
+	# by comparing original text with edited text
+	
+	# Strip any existing tags from edited text to get clean comparison
+	var clean_edited = _strip_all_tags(edited)
+	
+	# If no actual changes, return original
+	if original.strip_edges() == clean_edited:
+		return original
+	
+	# Tokenize both texts
+	var tokens_original = _tokenize_text(original)
+	var tokens_edited = _tokenize_text(clean_edited)
+	
+	# Compute LCS and generate diff
+	var dp = _compute_lcs_table(tokens_original, tokens_edited)
+	var diff = _backtrack_diff(tokens_original, tokens_edited, dp)
+	
+	# Detect modifications (del+add at same position)
+	diff = _detect_modifications(diff)
+	
+	# Build final tagged text
+	return _build_tagged_text(diff)
+
+# ============================================================================
+# LIVE INLINE HIGHLIGHTING SYSTEM
+# Display markers: [] for add, [/] for del, [*] for mod
+# Storage tags: [rev_add][/rev_add], [rev_del][/rev_del], [rev_mod][/rev_mod]
+# ============================================================================
+
+func _setup_inline_highlighter():
+	# Create CodeHighlighter for coloring tagged regions
+	edit_highlighter = CodeHighlighter.new()
+	edit_highlighter.number_color = Color(1, 1, 1)
+	edit_highlighter.symbol_color = Color(1, 1, 1)
+	edit_highlighter.function_color = Color(1, 1, 1)
+	edit_highlighter.member_variable_color = Color(1, 1, 1)
+	
+	# Display markers for live editing:
+	# [/text/] = red (deletion - original text being removed)
+	# [text] = green (addition - new text)
+	# [*text*] = yellow (modification - replacement text)
+	edit_highlighter.add_color_region("[/", "/]", Color(1.0, 0.3, 0.3), false)  # Red for deletions
+	edit_highlighter.add_color_region("[+", "+]", Color(0.4, 1.0, 0.4), false)  # Green for additions  
+	edit_highlighter.add_color_region("[*", "*]", Color(1.0, 0.855, 0.4), false)  # Yellow for modifications
+	
+	edited_text_display.syntax_highlighter = edit_highlighter
+
+func _on_edited_text_changed():
+	if is_updating_text:
+		return
+	
+	var current_text = edited_text_display.text
+	var caret_line = edited_text_display.get_caret_line()
+	var caret_column = edited_text_display.get_caret_column()
+	
+	# Get clean versions (strip display markers)
+	var clean_current = _strip_display_markers(current_text)
+	var clean_previous = _strip_display_markers(previous_edited_text)
+	
+	# Only process if actual content changed
+	if clean_current != clean_previous:
+		# Detect the type of edit based on what happened
+		var edit_info = _detect_edit_type(clean_previous, clean_current, previous_caret_column, caret_column)
+		
+		# Apply the appropriate marking
+		_apply_live_markers(edit_info, caret_line, caret_column)
+	
+	# Update previous state
+	previous_edited_text = edited_text_display.text
+	previous_caret_line = edited_text_display.get_caret_line()
+	previous_caret_column = edited_text_display.get_caret_column()
+
+func _strip_display_markers(text: String) -> String:
+	# Remove display markers but handle deletion markers specially
+	# Deletion markers [/text/] - the text inside should be removed from clean version
+	var result = text
+	
+	# Remove deletion markers AND their content (deleted text shouldn't be in clean)
+	var del_regex = RegEx.new()
+	del_regex.compile("\\[/[^/]*/\\]")
+	result = del_regex.sub(result, "", true)
+	
+	# Remove add/mod markers but keep content
+	result = result.replace("[+", "").replace("+]", "")
+	result = result.replace("[*", "").replace("*]", "")
+	
+	return result
+
+func _detect_edit_type(old_text: String, new_text: String, _old_caret: int, new_caret: int) -> Dictionary:
+	# Detect what type of edit occurred based on text changes and caret movement
+	var info = {
+		"type": "none",  # "add", "del", "mod"
+		"position": new_caret,
+		"old_text": old_text,
+		"new_text": new_text,
+		"changed_content": ""
+	}
+	
+	var old_len = old_text.length()
+	var new_len = new_text.length()
+	
+	if new_len > old_len:
+		# Text got longer = addition
+		info.type = "add"
+		# Find what was added
+		var added_len = new_len - old_len
+		var add_start = new_caret - added_len
+		if add_start >= 0 and add_start + added_len <= new_len:
+			info.changed_content = new_text.substr(add_start, added_len)
+			info.position = add_start
+	elif new_len < old_len:
+		# Text got shorter = deletion
+		info.type = "del"
+		# Find what was deleted
+		var del_len = old_len - new_len
+		var del_start = new_caret
+		if del_start >= 0 and del_start + del_len <= old_len:
+			info.changed_content = old_text.substr(del_start, del_len)
+			info.position = del_start
+	
+	return info
+
+func _apply_live_markers(edit_info: Dictionary, caret_line: int, caret_column: int):
+	if edit_info.type == "none":
+		return
+	
+	# Get the current displayed text (with old markers)
+	var current_display_text = edited_text_display.text
+	
+	# Get current clean text
+	var clean_text = _strip_display_markers(current_display_text)
+	
+	# Check if text now matches original - if so, clear all markers
+	if clean_text.strip_edges() == current_original_text.strip_edges():
+		is_updating_text = true
+		edited_text_display.text = clean_text
+		edited_text_display.set_caret_line(caret_line)
+		edited_text_display.set_caret_column(caret_column)
+		is_updating_text = false
+		edited_text_display.grab_focus()
+		return
+	
+	# First: convert caret position from OLD marked text to clean text position
+	var clean_caret = _marked_to_clean_position(current_display_text, caret_line, caret_column)
+	
+	# Build new marked text
+	var marked_text = _build_display_text(current_original_text, clean_text)
+	
+	# Then: convert clean position to NEW marked text position
+	var new_caret = _clean_to_marked_position(clean_text, marked_text, clean_caret.line, clean_caret.column)
+	
+	is_updating_text = true
+	edited_text_display.text = marked_text
+	edited_text_display.set_caret_line(new_caret.line)
+	edited_text_display.set_caret_column(new_caret.column)
+	is_updating_text = false
+	edited_text_display.grab_focus()
+
+func _marked_to_clean_position(marked_text: String, line: int, column: int) -> Dictionary:
+	# Convert a position in marked text to position in clean text
+	# (skip marker characters when counting)
+	
+	var marked_lines = marked_text.split("\n")
+	
+	# Get the character index in the marked text
+	var marked_char_idx = 0
+	for l in range(min(line, marked_lines.size())):
+		marked_char_idx += marked_lines[l].length() + 1
+	if line < marked_lines.size():
+		marked_char_idx += min(column, marked_lines[line].length())
+	
+	# Walk through marked text, counting clean characters
+	var clean_char_idx = 0
+	var i = 0
+	
+	while i < marked_text.length() and i < marked_char_idx:
+		# Check for marker patterns
+		if i + 1 < marked_text.length():
+			var two = marked_text.substr(i, 2)
+			if two == "[/" or two == "[+" or two == "[*":
+				var close_marker = two[1] + "]"
+				var end_pos = marked_text.find(close_marker, i + 2)
+				if end_pos != -1:
+					if two == "[/":
+						# Deletion - skip entirely, no clean chars
+						if i + 2 <= marked_char_idx:
+							if end_pos + 2 <= marked_char_idx:
+								# Cursor is past this whole marker
+								i = end_pos + 2
+								continue
+							else:
+								# Cursor is inside or at marker
+								i = marked_char_idx
+								continue
+					else:
+						# Add/mod - marker chars don't count, content does
+						i += 2  # skip opening marker
+						if i >= marked_char_idx:
+							break
+						# Count content chars
+						while i < end_pos and i < marked_char_idx:
+							i += 1
+							clean_char_idx += 1
+						if i >= marked_char_idx:
+							break
+						# Skip closing marker
+						i += 2
+						continue
+		
+		# Regular character
+		i += 1
+		clean_char_idx += 1
+	
+	# Convert clean_char_idx to line/column
+	var clean_text = _strip_display_markers(marked_text)
+	var clean_lines = clean_text.split("\n")
+	var new_line = 0
+	var pos = 0
+	
+	for l in range(clean_lines.size()):
+		if pos + clean_lines[l].length() >= clean_char_idx:
+			new_line = l
+			break
+		pos += clean_lines[l].length() + 1
+		new_line = l
+	
+	var new_col = clean_char_idx - pos
+	if new_line < clean_lines.size():
+		new_col = min(new_col, clean_lines[new_line].length())
+	
+	return {"line": new_line, "column": max(0, new_col)}
+
+func _clean_to_marked_position(clean_text: String, marked_text: String, line: int, column: int) -> Dictionary:
+	# Convert a position in clean text to position in marked text
+	
+	# First, convert line/column to character index in clean text
+	var clean_lines = clean_text.split("\n")
+	var clean_char_idx = 0
+	for l in range(min(line, clean_lines.size())):
+		clean_char_idx += clean_lines[l].length() + 1  # +1 for newline
+	if line < clean_lines.size():
+		clean_char_idx += min(column, clean_lines[line].length())
+	
+	# Now find corresponding position in marked text
+	# Walk through marked text, tracking "clean" characters seen
+	var marked_idx = 0
+	var clean_counted = 0
+	var i = 0
+	
+	while i < marked_text.length():
+		# Stop if we've counted enough clean characters
+		if clean_counted >= clean_char_idx:
+			break
+		
+		# Check for marker starts: [/ [+ [*
+		if i + 1 < marked_text.length():
+			var two = marked_text.substr(i, 2)
+			if two == "[/" or two == "[+" or two == "[*":
+				var close_marker = two[1] + "]"  # "/]" or "+]" or "*]"
+				var end_pos = marked_text.find(close_marker, i + 2)
+				if end_pos != -1:
+					# For deletions [/text/], skip entirely (not in clean text)
+					if two == "[/":
+						i = end_pos + 2
+						marked_idx = end_pos + 2
+						continue
+					else:
+						# For adds [+text+] and mods [*text*], the content IS in clean text
+						# Skip the opening marker
+						i += 2
+						marked_idx += 2
+						# Now count the content characters
+						while i < end_pos and clean_counted < clean_char_idx:
+							i += 1
+							marked_idx += 1
+							clean_counted += 1
+						# If we've reached our target, break
+						if clean_counted >= clean_char_idx:
+							break
+						# Skip closing marker
+						i += 2
+						marked_idx += 2
+						continue
+		
+		# Regular character - count it
+		i += 1
+		marked_idx += 1
+		clean_counted += 1
+	
+	# Convert marked_idx back to line/column
+	var marked_lines = marked_text.split("\n")
+	var new_line = 0
+	var pos_counted = 0
+	
+	for l in range(marked_lines.size()):
+		var line_len = marked_lines[l].length()
+		if pos_counted + line_len >= marked_idx:
+			new_line = l
+			break
+		pos_counted += line_len + 1  # +1 for newline
+		new_line = l
+	
+	var new_col = marked_idx - pos_counted
+	if new_line < marked_lines.size():
+		new_col = min(new_col, marked_lines[new_line].length())
+	new_col = max(0, new_col)
+	
+	return {"line": new_line, "column": new_col}
+
+func _build_display_text(original: String, edited: String) -> String:
+	# Build text with display markers showing what changed
+	# Compare word by word and mark:
+	# - Words in original but not in edited position = [/deleted/]
+	# - Words in edited but not in original = [+added+]
+	# - Words that replaced others = [*modified*]
+	
+	var orig_words = _split_into_words(original)
+	var edit_words = _split_into_words(edited)
+	
+	# Simple approach: find matching words and mark differences
+	var result = ""
+	var orig_idx = 0
+	var edit_idx = 0
+	
+	while orig_idx < orig_words.size() or edit_idx < edit_words.size():
+		if orig_idx >= orig_words.size():
+			# Remaining edited words are additions
+			while edit_idx < edit_words.size():
+				if result != "" and not result.ends_with(" ") and not _is_punctuation(edit_words[edit_idx]):
+					result += " "
+				result += "[+" + edit_words[edit_idx] + "+]"
+				edit_idx += 1
+			break
+		
+		if edit_idx >= edit_words.size():
+			# Remaining original words are deletions
+			while orig_idx < orig_words.size():
+				if result != "" and not result.ends_with(" "):
+					result += " "
+				result += "[/" + orig_words[orig_idx] + "/]"
+				orig_idx += 1
+			break
+		
+		var orig_word = orig_words[orig_idx]
+		var edit_word = edit_words[edit_idx]
+		
+		if orig_word == edit_word:
+			# Words match - keep as is
+			if result != "" and not result.ends_with(" ") and not _is_punctuation(orig_word):
+				result += " "
+			result += orig_word
+			orig_idx += 1
+			edit_idx += 1
+		else:
+			# Words differ - check if it's a modification or del+add
+			# Look ahead to see if orig_word appears later in edit_words
+			var orig_found_later = _find_word_ahead(orig_word, edit_words, edit_idx + 1)
+			var edit_found_later = _find_word_ahead(edit_word, orig_words, orig_idx + 1)
+			
+			if not orig_found_later and not edit_found_later:
+				# Neither word found ahead - it's a MODIFICATION (one word replaced another)
+				# Only show the modified word, no deletion marker
+				if result != "" and not result.ends_with(" "):
+					result += " "
+				result += "[*" + edit_word + "*]"
+				orig_idx += 1
+				edit_idx += 1
+			elif orig_found_later:
+				# Original word found later - current edit word is an addition
+				if result != "" and not result.ends_with(" ") and not _is_punctuation(edit_word):
+					result += " "
+				result += "[+" + edit_word + "+]"
+				edit_idx += 1
+			else:
+				# Edit word found later - current orig word is a deletion
+				if result != "" and not result.ends_with(" "):
+					result += " "
+				result += "[/" + orig_word + "/]"
+				orig_idx += 1
+	
+	# Clean up spacing
+	result = result.replace(" .", ".").replace(" ,", ",").replace(" ;", ";")
+	result = result.replace(" :", ":").replace(" !", "!").replace(" ?", "?")
+	
+	return result.strip_edges()
+
+func _split_into_words(text: String) -> Array:
+	# Split text into words, keeping punctuation attached
+	var words = []
+	var current = ""
+	
+	for i in range(text.length()):
+		var c = text[i]
+		if c == " " or c == "\n" or c == "\t":
+			if current != "":
+				words.append(current)
+				current = ""
+		else:
+			current += c
+	
+	if current != "":
+		words.append(current)
+	
+	return words
+
+func _find_word_ahead(word: String, words: Array, start_idx: int) -> bool:
+	# Check if word appears in words array starting from start_idx
+	for i in range(start_idx, min(start_idx + 5, words.size())):  # Look max 5 words ahead
+		if words[i] == word:
+			return true
+	return false
+
+func _is_punctuation(token: String) -> bool:
+	return token in [".", ",", ";", ":", "!", "?", ")", "]", "\"", "'"]
 
 func setup_toc():
 	for child in toc_container.get_children():
@@ -598,9 +1239,39 @@ func update_display():
 	var current_text = book.get_current_text()
 	text_display.text = current_text
 	
+	# Store original text for live diff comparison
+	current_original_text = current_text
+	
+	# Reset toggle state when changing verses
+	showing_original = false
+	
 	var chapter_verse = book.get_chapter_verse()
 	var saved_edit = load_edit(chapter_verse)
-	edited_text_display.text = saved_edit if saved_edit else current_text
+	
+	# If there's a saved edit, extract clean text (strip tags) for display
+	# User always sees clean text in the editor (or with markers if there are changes)
+	var display_text: String
+	if saved_edit:
+		display_text = _strip_all_tags(saved_edit)
+	else:
+		display_text = current_text
+	
+	# Apply inline highlighter
+	edited_text_display.syntax_highlighter = edit_highlighter
+	
+	# Set text and initialize previous state
+	is_updating_text = true
+	edited_text_display.text = display_text
+	previous_edited_text = display_text
+	is_updating_text = false
+	
+	# Rebuild with markers if there are changes
+	if display_text.strip_edges() != current_text.strip_edges():
+		var marked = _build_display_text(current_text, display_text)
+		is_updating_text = true
+		edited_text_display.text = marked
+		previous_edited_text = marked
+		is_updating_text = false
 	
 	# Get chapter title and display with full format
 	var chapter_title = book.chapter_titles[book.current_chapter - 1] if book.current_chapter - 1 < book.chapter_titles.size() else ""
@@ -672,21 +1343,225 @@ func _on_save_button_pressed():
 	var original_text = text_display.text
 	var edited_text = edited_text_display.text
 	
-	# Don't save if text hasn't changed
-	if original_text == edited_text:
+	# Strip display markers to get clean edited text
+	var clean_edited = _strip_display_markers(edited_text)
+	
+	# Check if there are actual changes
+	if original_text.strip_edges() == clean_edited.strip_edges():
 		print("No changes to save for " + chapter_verse)
 		return
 	
-	save_edit(chapter_verse, edited_text)
+	# Auto-generate storage tags based on diff
+	var text_to_save = generate_auto_tags(original_text, clean_edited)
+	
+	# Save the edited text with storage tags
+	save_edit(chapter_verse, text_to_save)
+	
+	# Update TOC
 	update_toc_edit_indicators()
 	save_session_data()
+	
+	print("Saved changes for " + chapter_verse)
 
 func _on_changes_clear_button_pressed():
-	edited_text_display.text = text_display.text
 	var chapter_verse = book.get_chapter_verse()
-	clear_edit(chapter_verse)
-	# Update TOC to remove edit indicator
-	update_toc_edit_indicators()
+	var original_text = text_display.text
+	var saved_edit = edited_verses.get(chapter_verse, "")
+	
+	# Get clean versions for comparison (strip all markers and tags)
+	var current_clean = _strip_display_markers(edited_text_display.text)
+	current_clean = _strip_all_tags(current_clean).strip_edges()
+	var original_clean = original_text.strip_edges()
+	var saved_clean = _strip_all_tags(saved_edit).strip_edges() if saved_edit else ""
+	
+	if saved_edit != "" and current_clean != saved_clean:
+		# Current is different from saved edit - load saved edit with live markers
+		var display_text = _strip_all_tags(saved_edit)
+		var marked_text = _build_display_text(original_text, display_text)
+		is_updating_text = true
+		edited_text_display.text = marked_text
+		previous_edited_text = marked_text
+		is_updating_text = false
+	elif current_clean != original_clean:
+		# Current differs from original - load original
+		is_updating_text = true
+		edited_text_display.text = original_text
+		previous_edited_text = original_text
+		is_updating_text = false
+	elif saved_edit != "":
+		# Current is original and there's a saved edit - load saved edit with live markers
+		var display_text = _strip_all_tags(saved_edit)
+		var marked_text = _build_display_text(original_text, display_text)
+		is_updating_text = true
+		edited_text_display.text = marked_text
+		previous_edited_text = marked_text
+		is_updating_text = false
+
+func _on_export_button_pressed():
+	# Use built-in ConfirmationDialog
+	var dialog = ConfirmationDialog.new()
+	dialog.title = "Export"
+	dialog.dialog_text = ""
+	dialog.ok_button_text = "TXT"
+	dialog.cancel_button_text = "Cancel"
+	
+	# Add JSON button and get reference
+	var json_button = dialog.add_button("JSON", 0)
+	
+	# Make buttons bigger
+	dialog.get_ok_button().custom_minimum_size = Vector2(100, 50)
+	dialog.get_cancel_button().custom_minimum_size = Vector2(100, 50)
+	json_button.custom_minimum_size = Vector2(100, 50)
+	
+	dialog.confirmed.connect(func():
+		_export_as_txt()
+		dialog.queue_free()
+	)
+	
+	json_button.pressed.connect(func():
+		_export_as_json()
+		dialog.queue_free()
+	)
+	
+	dialog.canceled.connect(func():
+		dialog.queue_free()
+	)
+	
+	add_child(dialog)
+	dialog.popup_centered(Vector2i(350, 120))
+
+func _export_as_txt():
+	# Export the edited version of the book as TXT
+	var export_text = ""
+	var del_regex = RegEx.new()
+	del_regex.compile("\\[rev_del\\].*?\\[/rev_del\\]")
+	
+	# Iterate through all chapters (1-22)
+	for chapter_num in range(1, 23):
+		if not book.chapters.has(chapter_num):
+			continue
+		var chapter_title = book.chapter_titles[chapter_num - 1] if chapter_num - 1 < book.chapter_titles.size() else ""
+		
+		export_text += "\n\n"
+		export_text += "CHAPTER %d\n" % [chapter_num]
+		export_text += chapter_title + "\n\n"
+		
+		var verses = book.chapters[chapter_num]
+		for verse_idx in range(verses.size()):
+			var verse_data = verses[verse_idx]
+			if verse_data == null:
+				continue
+			var verse_num = verse_idx + 1
+			var chapter_verse = "Chapter %d, Verse %d" % [chapter_num, verse_num]
+			var verse_text = verse_data["text"]  # Extract text from verse dictionary
+			
+			# Check if there's an edited version
+			if edited_verses.has(chapter_verse):
+				verse_text = edited_verses[chapter_verse]
+				
+				# Convert to string if it's stored as something else
+				if not verse_text is String:
+					verse_text = str(verse_text)
+				
+				# Remove [rev_del] tags and their contents
+				verse_text = del_regex.sub(verse_text, "", true)
+				# Strip [rev_add] and [rev_mod] tags but keep their contents
+				verse_text = verse_text.replace("[rev_add]", "").replace("[/rev_add]", "")
+				verse_text = verse_text.replace("[rev_mod]", "").replace("[/rev_mod]", "")
+				verse_text = verse_text.replace("  ", " ").strip_edges()
+			
+			export_text += "%d  %s\n" % [verse_num, verse_text]
+	
+	# Save to file
+	pending_export_text = export_text
+	pending_export_format = "txt"
+	
+	if OS.has_feature("web"):
+		# For web, copy to clipboard and notify
+		DisplayServer.clipboard_set(export_text)
+		print("Exported to clipboard (web mode)")
+	else:
+		# Show file dialog for picking location
+		if file_dialog:
+			file_dialog.queue_free()
+			file_dialog = null
+		file_dialog = FileDialog.new()
+		file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		file_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+		file_dialog.filters = PackedStringArray(["*.txt ; Text Files"])
+		file_dialog.title = "Export as TXT"
+		file_dialog.current_file = "revelation_edited.txt"
+		file_dialog.file_selected.connect(_on_export_file_selected)
+		add_child(file_dialog)
+		file_dialog.popup_centered(Vector2(800, 600))
+
+func _export_as_json():
+	# Export edited verses as JSON for sharing/importing
+	var json_data = JSON.stringify(edited_verses)
+	
+	pending_export_text = json_data
+	pending_export_format = "json"
+	
+	if OS.has_feature("web"):
+		# For web, copy to clipboard and notify
+		DisplayServer.clipboard_set(json_data)
+		print("Exported to clipboard (web mode)")
+	else:
+		# Show file dialog for picking location
+		if file_dialog:
+			file_dialog.queue_free()
+			file_dialog = null
+		file_dialog = FileDialog.new()
+		file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		file_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+		file_dialog.filters = PackedStringArray(["*.json ; JSON Files"])
+		file_dialog.title = "Export as JSON"
+		file_dialog.current_file = "revelation_edits.json"
+		file_dialog.file_selected.connect(_on_export_file_selected)
+		add_child(file_dialog)
+		file_dialog.popup_centered(Vector2(800, 600))
+
+func _on_export_file_selected(path: String):
+	var file = FileAccess.open(path, FileAccess.WRITE)
+	if file:
+		file.store_string(pending_export_text)
+		file.close()
+		print("Exported to: " + path)
+	else:
+		print("Failed to export to: " + path)
+
+func _on_import_button_pressed():
+	# Open file dialog to import edited verses
+	if not file_dialog:
+		file_dialog = FileDialog.new()
+		file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+		file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		file_dialog.filters = PackedStringArray(["*.json ; JSON Files"])
+		file_dialog.title = "Import Edits"
+		file_dialog.file_selected.connect(_on_import_file_selected)
+		add_child(file_dialog)
+	else:
+		# Reuse existing dialog but change mode
+		file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+		file_dialog.title = "Import Edits"
+		file_dialog.filters = PackedStringArray(["*.json ; JSON Files"])
+	file_dialog.popup_centered(Vector2(800, 600))
+
+func _on_import_file_selected(path: String):
+	var file = FileAccess.open(path, FileAccess.READ)
+	if file:
+		var content = file.get_as_text()
+		file.close()
+		var data = JSON.parse_string(content)
+		if data and typeof(data) == TYPE_DICTIONARY:
+			edited_verses = data
+			save_session_data()
+			update_display()
+			print("Imported edits from: " + path)
+		else:
+			print("Invalid JSON file format")
+	else:
+		print("Failed to open file: " + path)
 
 func save_edit(chapter_verse: String, text: String):
 	var save_data = {}
